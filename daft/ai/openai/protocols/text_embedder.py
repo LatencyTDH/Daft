@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from openai import AsyncOpenAI, OpenAIError, RateLimitError
@@ -12,8 +12,8 @@ from openai.types.create_embedding_response import Usage
 from daft import DataType
 from daft.ai.metrics import record_token_metrics
 from daft.ai.openai.typing import OpenAIProviderOptions
-from daft.ai.protocols import TextEmbedder, TextEmbedderDescriptor
-from daft.ai.typing import EmbeddingDimensions, EmbedTextOptions, Options, UDFOptions
+from daft.ai.protocols import TextEmbedder
+from daft.ai.typing import EmbeddingDimensions, EmbedTextOptions
 from daft.ai.utils import merge_provider_and_api_options
 from daft.dependencies import np
 
@@ -22,6 +22,10 @@ if TYPE_CHECKING:
     from openai.types.create_embedding_response import CreateEmbeddingResponse
 
     from daft.ai.typing import Embedding
+
+# ------------------------------------------------------------------
+# Model Profiles
+# ------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -63,6 +67,10 @@ _models: dict[EmbeddingModel, _ModelProfile] = {
     ),
 }
 
+# ------------------------------------------------------------------
+# Helper Functions
+# ------------------------------------------------------------------
+
 
 def get_input_text_token_limit_for_model(model_name: str) -> int:
     """Get the input token limit for a model, with fallback to default.
@@ -79,94 +87,70 @@ def get_input_text_token_limit_for_model(model_name: str) -> int:
         return 8192  # Default for unknown/custom models
 
 
-@dataclass
-class OpenAITextEmbedderDescriptor(TextEmbedderDescriptor):
-    provider_name: str
-    provider_options: OpenAIProviderOptions
-    model_name: str
-    dimensions: int | None
-    embed_options: EmbedTextOptions = field(
-        default_factory=lambda: EmbedTextOptions(batch_size=64, max_retries=3, on_error="raise")
-    )
+def _validate_model(model_name: str, dimensions: int | None, embed_options: EmbedTextOptions) -> EmbedTextOptions:
+    """Validates model support and dimension override capability for standard OpenAI models.
 
-    def __post_init__(self) -> None:
-        if self.provider_options.get("base_url") is None:
-            if self.model_name not in _models:
-                supported_models = ", ".join(_models.keys())
-                raise ValueError(
-                    f"Unsupported OpenAI embedding model '{self.model_name}', expected one of: {supported_models}"
-                )
-            model = _models[self.model_name]
-            if self.dimensions is not None:
-                if model.supports_overriding_dimensions:
-                    if "supports_overriding_dimensions" not in self.embed_options:
-                        self.embed_options["supports_overriding_dimensions"] = True
-                else:
-                    raise ValueError(
-                        f"OpenAI embedding model '{self.model_name}' does not support specifying dimensions"
-                    )
-
-    def get_provider(self) -> str:
-        return self.provider_name
-
-    def get_model(self) -> str:
-        return self.model_name
-
-    def get_options(self) -> Options:
-        return dict(self.embed_options)
-
-    def get_dimensions(self) -> EmbeddingDimensions:
-        if self.dimensions is not None:
-            return EmbeddingDimensions(size=self.dimensions, dtype=_models[self.model_name].dimensions.dtype)
-
-        if self.provider_options.get("base_url") is not None and self.model_name not in _models:
-            try:
-                merged_provider_options: dict[str, Any] = merge_provider_and_api_options(
-                    provider_options=self.provider_options,
-                    api_options=self.embed_options,
-                    provider_option_type=OpenAIProviderOptions,
-                )
-
-                client = OpenAIClient(**merged_provider_options)
-                response = client.embeddings.create(
-                    input="dimension probe",
-                    model=self.model_name,
-                    encoding_format="float",
-                )
-                size = len(response.data[0].embedding)
-                return EmbeddingDimensions(size=size, dtype=DataType.float32())
-            except Exception as ex:
-                raise ValueError(
-                    "Failed to determine embedding dimensions from OpenAI-compatible embedding server. "
-                    "Specify `dimensions=...` or ensure the server supports embeddings.create."
-                ) from ex
+    Returns a (potentially updated) copy of embed_options with supports_overriding_dimensions set.
+    """
+    if model_name not in _models:
+        supported_models = ", ".join(_models.keys())
+        raise ValueError(f"Unsupported OpenAI embedding model '{model_name}', expected one of: {supported_models}")
+    if dimensions is not None:
+        profile = _models[model_name]
+        if profile.supports_overriding_dimensions:
+            if "supports_overriding_dimensions" not in embed_options:
+                embed_options = {**embed_options, "supports_overriding_dimensions": True}
         else:
-            return _models[self.model_name].dimensions
+            raise ValueError(f"OpenAI embedding model '{model_name}' does not support specifying dimensions")
+    return embed_options
 
-    def get_udf_options(self) -> UDFOptions:
-        options = super().get_udf_options()
-        options.max_retries = 0  # OpenAI client handles retries internally
-        return options
 
-    def is_async(self) -> bool:
-        return True
+def _resolve_dimensions(
+    model_name: str,
+    dimensions_override: int | None,
+    provider_options: OpenAIProviderOptions,
+    embed_options: EmbedTextOptions,
+) -> EmbeddingDimensions:
+    """Resolves the output embedding dimensions for a model.
 
-    def instantiate(self) -> TextEmbedder:
-        # Get batch_token_limit from embed_options, default to 300_000
-        batch_token_limit = self.embed_options.get("batch_token_limit", 300_000)
+    Uses the override if provided, probes the server for custom base_url,
+    or falls back to the known model profile.
+    """
+    if dimensions_override is not None:
+        dtype = _models[model_name].dimensions.dtype if model_name in _models else DataType.float32()
+        return EmbeddingDimensions(size=dimensions_override, dtype=dtype)
 
-        # Get input_text_token_limit from model profile using helper function
-        input_text_token_limit = get_input_text_token_limit_for_model(self.model_name)
+    if provider_options.get("base_url") is not None and model_name not in _models:
+        try:
+            merged: dict[str, Any] = merge_provider_and_api_options(
+                provider_options=provider_options,
+                api_options=embed_options,
+                provider_option_type=OpenAIProviderOptions,
+            )
+            client = OpenAIClient(**merged)
+            response = client.embeddings.create(
+                input="dimension probe",
+                model=model_name,
+                encoding_format="float",
+            )
+            size = len(response.data[0].embedding)
+            return EmbeddingDimensions(size=size, dtype=DataType.float32())
+        except Exception as ex:
+            raise ValueError(
+                "Failed to determine embedding dimensions from OpenAI-compatible embedding server. "
+                "Specify `dimensions=...` or ensure the server supports embeddings.create."
+            ) from ex
 
-        return OpenAITextEmbedder(
-            provider_options=self.provider_options,
-            model=self.model_name,
-            embed_options=self.embed_options,
-            dimensions=self.dimensions if self.embed_options.get("supports_overriding_dimensions", False) else omit,
-            provider_name=self.provider_name,
-            batch_token_limit=batch_token_limit,
-            input_text_token_limit=input_text_token_limit,
-        )
+    return _models[model_name].dimensions
+
+
+def chunk_text(text: str, size: int) -> list[str]:
+    return [text[i : i + size] for i in range(0, len(text), size)]
+
+
+# ------------------------------------------------------------------
+# OpenAITextEmbedder
+# ------------------------------------------------------------------
 
 
 class OpenAITextEmbedder(TextEmbedder):
@@ -314,7 +298,3 @@ class OpenAITextEmbedder(TextEmbedder):
             input_tokens=input_tokens,
             total_tokens=total_tokens,
         )
-
-
-def chunk_text(text: str, size: int) -> list[str]:
-    return [text[i : i + size] for i in range(0, len(text), size)]
