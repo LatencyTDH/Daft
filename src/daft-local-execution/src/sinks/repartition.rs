@@ -64,9 +64,12 @@ impl BlockingSink for RepartitionSink {
         let repartition_spec = self.repartition_spec.clone();
         let num_partitions = self.num_partitions;
         let schema = self.schema.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
         spawner
             .spawn(
                 async move {
+                    // Repartition preserves total data size, so input size is accurate
+                    runtime_stats.add_bytes_retained(input.size_bytes() as u64);
                     let partitioned = match repartition_spec {
                         RepartitionSpec::Hash(config) => {
                             let bound_exprs = config
@@ -101,10 +104,12 @@ impl BlockingSink for RepartitionSink {
     ) -> BlockingSinkFinalizeResult<Self> {
         let num_partitions = self.num_partitions;
         let schema = self.schema.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
 
         spawner
             .spawn(
                 async move {
+                    runtime_stats.reset_bytes_retained();
                     let mut repart_states = states.iter_mut().collect::<Vec<_>>();
 
                     let mut outputs = Vec::new();

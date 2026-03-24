@@ -78,9 +78,11 @@ impl BlockingSink for WindowOrderByOnlySink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkSinkResult<Self> {
         let sink_name = self.name().to_string();
+        let runtime_stats = spawner.runtime_stats().clone();
         spawner
             .spawn(
                 async move {
+                    runtime_stats.add_bytes_retained(input.size_bytes() as u64);
                     state.push(input, &sink_name)?;
                     Ok(state)
                 },
@@ -96,10 +98,12 @@ impl BlockingSink for WindowOrderByOnlySink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkFinalizeResult<Self> {
         let params = self.params.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
 
         spawner
             .spawn(
                 async move {
+                    runtime_stats.reset_bytes_retained();
                     // Gather all partitions from all states
                     let all_partitions = states
                         .into_iter()

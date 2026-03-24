@@ -89,6 +89,7 @@ impl BlockingSink for TopNSink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkSinkResult<Self> {
         let params = self.params.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
 
         spawner
             .spawn(
@@ -104,7 +105,9 @@ impl BlockingSink for TopNSink {
                     )?;
 
                     // Append to the collection of existing top N values
-                    state.append(Arc::new(top_input_rows));
+                    let top = Arc::new(top_input_rows);
+                    runtime_stats.add_bytes_retained(top.size_bytes() as u64);
+                    state.append(top);
                     Ok(state)
                 },
                 Span::current(),
@@ -119,10 +122,12 @@ impl BlockingSink for TopNSink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkFinalizeResult<Self> {
         let params = self.params.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
         spawner
             .spawn(
                 async move {
                     let parts = states.into_iter().flat_map(|mut state| state.finalize());
+                    runtime_stats.reset_bytes_retained();
                     let concated = MicroPartition::concat(parts)?;
                     let final_output = Arc::new(concated.top_n(
                         &params.sort_by,

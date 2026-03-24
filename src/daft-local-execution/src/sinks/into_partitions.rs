@@ -58,8 +58,11 @@ impl BlockingSink for IntoPartitionsSink {
         &self,
         input: Arc<MicroPartition>,
         mut state: Self::State,
-        _spawner: &ExecutionTaskSpawner,
+        spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkSinkResult<Self> {
+        spawner
+            .runtime_stats()
+            .add_bytes_retained(input.size_bytes() as u64);
         state.push(input);
         Ok(state).into()
     }
@@ -72,6 +75,7 @@ impl BlockingSink for IntoPartitionsSink {
     ) -> BlockingSinkFinalizeResult<Self> {
         let num_partitions = self.num_partitions;
         let schema = self.schema.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
 
         spawner
             .spawn(
@@ -81,6 +85,7 @@ impl BlockingSink for IntoPartitionsSink {
                         .into_iter()
                         .flat_map(|mut state| state.finalize())
                         .collect();
+                    runtime_stats.reset_bytes_retained();
 
                     // Concatenate all data
                     let concatenated = MicroPartition::concat(all_parts)?;

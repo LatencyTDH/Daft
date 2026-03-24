@@ -87,10 +87,12 @@ impl BlockingSink for AggregateSink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkSinkResult<Self> {
         let params = self.agg_sink_params.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
         spawner
             .spawn(
                 async move {
                     let agged = Arc::new(input.agg(&params.sink_agg_exprs, &[])?);
+                    runtime_stats.add_bytes_retained(agged.size_bytes() as u64);
                     state.push(agged);
                     Ok(state)
                 },
@@ -106,10 +108,12 @@ impl BlockingSink for AggregateSink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkFinalizeResult<Self> {
         let params = self.agg_sink_params.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
         spawner
             .spawn(
                 async move {
                     let all_parts = states.into_iter().flat_map(|mut state| state.finalize());
+                    runtime_stats.reset_bytes_retained();
                     let concated = MicroPartition::concat(all_parts)?;
                     let agged = concated.agg(&params.finalize_agg_exprs, &[])?;
                     let projected = agged.eval_expression_list(&params.final_projections)?;

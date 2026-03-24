@@ -212,6 +212,10 @@ impl ExecutionTaskSpawner {
         );
         self.runtime_ref.spawn(timed_fut)
     }
+
+    pub fn runtime_stats(&self) -> &Arc<dyn RuntimeStats> {
+        &self.runtime_stats
+    }
 }
 
 // ---------------------------- STDOUT / STDERR PIPING ---------------------------- //

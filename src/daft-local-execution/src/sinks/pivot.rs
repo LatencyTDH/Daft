@@ -80,8 +80,11 @@ impl BlockingSink for PivotSink {
         &self,
         input: Arc<MicroPartition>,
         mut state: Self::State,
-        _spawner: &ExecutionTaskSpawner,
+        spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkSinkResult<Self> {
+        spawner
+            .runtime_stats()
+            .add_bytes_retained(input.size_bytes() as u64);
         state.push(input);
         Ok(state).into()
     }
@@ -93,10 +96,12 @@ impl BlockingSink for PivotSink {
         spawner: &ExecutionTaskSpawner,
     ) -> BlockingSinkFinalizeResult<Self> {
         let pivot_params = self.pivot_params.clone();
+        let runtime_stats = spawner.runtime_stats().clone();
         spawner
             .spawn(
                 async move {
                     let all_parts = states.into_iter().flat_map(|mut state| state.finalize());
+                    runtime_stats.reset_bytes_retained();
                     let concated = MicroPartition::concat(all_parts)?;
 
                     let agged = if pivot_params.pre_agg {
