@@ -8,13 +8,18 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use common_error::DaftResult;
 use common_metrics::{NodeID, QueryEndState, QueryID, ops::NodeInfo, snapshot::StatSnapshotImpl};
 use common_runtime::RuntimeTask;
-use daft_context::Subscriber;
+use daft_context::{
+    Subscriber,
+    subscribers::events::{
+        EventHeader, OperatorEndEvent, OperatorMeta, OperatorStartEvent, StatsEvent,
+    },
+};
 use daft_dsl::common_treenode::{TreeNode, TreeNodeRecursion};
 use daft_local_plan::ExecutionStats;
 use futures::future;
@@ -28,6 +33,13 @@ use tracing::{Instrument, instrument::Instrumented};
 pub use values::{DefaultRuntimeStats, RuntimeStats};
 
 use crate::pipeline::PipelineNode;
+
+fn now_epoch_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is before UNIX_EPOCH")
+        .as_secs_f64()
+}
 
 fn should_enable_process_monitor() -> bool {
     if let Ok(val) = std::env::var("DAFT_PROCESS_MONITOR_ENABLED") {
@@ -95,6 +107,7 @@ impl RuntimeStatsManager {
         progress_bar: Option<&dyn ProgressBar>,
         subscribers: &[Arc<dyn Subscriber>],
         err_context: &'static str,
+        operators: &HashMap<NodeID, Arc<OperatorMeta>>,
     ) {
         let runtime_stats = &node_map[&node_id].1;
         let snapshot = runtime_stats.flush();
@@ -103,14 +116,28 @@ impl RuntimeStatsManager {
             progress_bar.finalize_node(node_id, &snapshot);
         }
 
-        let event = Arc::new(vec![(node_id, snapshot.to_stats())]);
-        for res in future::join_all(subscribers.iter().map(|subscriber| async {
-            subscriber
-                .on_exec_emit_stats(query_id.clone(), event.clone())
-                .await?;
-            subscriber
-                .on_exec_operator_end(query_id.clone(), node_id)
-                .await
+        let stats_event = Arc::new(StatsEvent {
+            header: EventHeader {
+                query_id: query_id.clone(),
+                timestamp_epoch_secs: now_epoch_secs(),
+            },
+            stats: Arc::new(vec![(node_id, snapshot.to_stats())]),
+        });
+
+        let end_event = Arc::new(OperatorEndEvent {
+            header: EventHeader {
+                query_id: query_id.clone(),
+                timestamp_epoch_secs: now_epoch_secs(),
+            },
+            operator: operators[&node_id].clone(),
+        });
+        for res in future::join_all(subscribers.iter().map(|subscriber| {
+            let stats_event = stats_event.clone();
+            let end_event = end_event.clone();
+            async move {
+                subscriber.on_stats(stats_event).await?;
+                subscriber.on_operator_end(end_event).await
+            }
         }))
         .await
         {
@@ -130,11 +157,16 @@ impl RuntimeStatsManager {
         // Construct mapping between node id and their node info and runtime stats
         let mut node_map = HashMap::new();
         let mut node_info_map = HashMap::new();
+        let mut operator_meta_map: HashMap<NodeID, Arc<OperatorMeta>> = HashMap::new();
         let _ = pipeline.apply(|node| {
             let node_info = node.node_info();
             let runtime_stats = node.runtime_stats();
             node_info_map.insert(node_info.id, node_info.clone());
-            node_map.insert(node_info.id, (node_info, runtime_stats));
+            node_map.insert(node_info.id, (node_info.clone(), runtime_stats));
+            operator_meta_map.insert(
+                node_info.id,
+                Arc::new(OperatorMeta::from(node_info.as_ref())),
+            );
             Ok(TreeNodeRecursion::Continue)
         });
 
@@ -163,6 +195,7 @@ impl RuntimeStatsManager {
             node_map,
             throttle_interval,
             enable_process_monitor,
+            operator_meta_map,
         ))
     }
 
@@ -177,6 +210,7 @@ impl RuntimeStatsManager {
         node_map: HashMap<NodeID, (Arc<NodeInfo>, Arc<dyn RuntimeStats>)>,
         throttle_interval: Duration,
         enable_process_monitor: bool,
+        operators: HashMap<NodeID, Arc<OperatorMeta>>,
     ) -> Self {
         let (node_tx, mut node_rx) = mpsc::unbounded_channel::<(usize, bool)>();
         let node_tx = Arc::new(node_tx);
@@ -204,7 +238,17 @@ impl RuntimeStatsManager {
                                 progress_bar.initialize_node(node_id);
                             }
 
-                            for res in future::join_all(subscribers.iter().map(|subscriber| subscriber.on_exec_operator_start(query_id.clone(), node_id))).await {
+                            let event = Arc::new(OperatorStartEvent {
+                                header: EventHeader {
+                                    query_id: query_id.clone(),
+                                    timestamp_epoch_secs: now_epoch_secs(),
+                                },
+                                operator: operators[&node_id].clone(),
+                            });
+
+                            for res in future::join_all(subscribers.iter().map(|subscriber| {
+                                subscriber.on_operator_start(event.clone())
+                            })).await {
                                 if let Err(e) = res {
                                     log::error!("Failed to initialize node: {}", e);
                                 }
@@ -217,6 +261,7 @@ impl RuntimeStatsManager {
                                 progress_bar.as_deref(),
                                 &subscribers,
                                 "finalize node",
+                                &operators,
                             )
                             .await;
                         }
@@ -233,6 +278,7 @@ impl RuntimeStatsManager {
                                 progress_bar.as_deref(),
                                 &subscribers,
                                 "finalize node during shutdown",
+                                &operators,
                             )
                             .await;
                         }
@@ -265,8 +311,15 @@ impl RuntimeStatsManager {
                         }
 
                         let snapshot_container = Arc::new(std::mem::take(&mut snapshot_container));
+                        let event = Arc::new(StatsEvent {
+                            header: EventHeader {
+                                query_id: query_id.clone(),
+                                timestamp_epoch_secs: now_epoch_secs(),
+                            },
+                            stats: snapshot_container.clone(),
+                        });
                         for res in future::join_all(subscribers.iter().map(|subscriber| {
-                            subscriber.on_exec_emit_stats(query_id.clone(), snapshot_container.clone())
+                            subscriber.on_stats(event.clone())
                         })).await {
                             if let Err(e) = res {
                                 log::error!("Failed to handle event: {}", e);
@@ -358,7 +411,10 @@ impl<F: Future> Future for TimedFuture<F> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{Arc, Mutex, atomic::AtomicU64};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex, atomic::AtomicU64},
+    };
 
     use async_trait::async_trait;
     use common_error::DaftResult;
@@ -371,6 +427,26 @@ mod tests {
     use tokio::time::{Duration, sleep};
 
     use super::*;
+
+    fn make_stats_manager(
+        subscribers: Vec<Arc<dyn Subscriber>>,
+        node_stat: Arc<dyn RuntimeStats>,
+        throttle_interval: Duration,
+        query_id: &str,
+        enable_process_monitor: bool,
+    ) -> RuntimeStatsManager {
+        RuntimeStatsManager::new_impl(
+            &tokio::runtime::Handle::current(),
+            query_id.into(),
+            serde_json::Value::Null,
+            subscribers,
+            None,
+            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat))]),
+            throttle_interval,
+            enable_process_monitor,
+            HashMap::from([(0, Arc::new(OperatorMeta::from(&NodeInfo::default())))]),
+        )
+    }
 
     #[derive(Debug)]
     struct MockState {
@@ -435,22 +511,18 @@ mod tests {
         async fn on_exec_end(&self, _: QueryID) -> DaftResult<()> {
             Ok(())
         }
-        async fn on_exec_operator_start(&self, _: QueryID, _: NodeID) -> DaftResult<()> {
+        async fn on_operator_start(&self, _: Arc<OperatorStartEvent>) -> DaftResult<()> {
             Ok(())
         }
-        async fn on_exec_operator_end(&self, _: QueryID, _: NodeID) -> DaftResult<()> {
+        async fn on_operator_end(&self, _: Arc<OperatorEndEvent>) -> DaftResult<()> {
             Ok(())
         }
 
-        async fn on_exec_emit_stats(
-            &self,
-            _query_id: QueryID,
-            stats: std::sync::Arc<Vec<(NodeID, Stats)>>,
-        ) -> DaftResult<()> {
+        async fn on_stats(&self, event: Arc<StatsEvent>) -> DaftResult<()> {
             self.state
                 .total_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            for (_, snapshot) in stats.iter() {
+            for (_, snapshot) in event.stats.iter() {
                 *self.state.event.lock().unwrap() = Some(snapshot.clone());
             }
             Ok(())
@@ -467,14 +539,11 @@ mod tests {
             &node_info_from_id(0),
         )) as Arc<dyn RuntimeStats>;
         let throttle_interval = Duration::from_millis(50);
-        let stats_manager = RuntimeStatsManager::new_impl(
-            &tokio::runtime::Handle::current(),
-            "test_query_id".into(),
-            serde_json::Value::Null,
+        let stats_manager = make_stats_manager(
             vec![mock_subscriber],
-            None,
-            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat.clone()))]),
+            node_stat.clone(),
             throttle_interval,
+            "test_ps_disabled",
             false,
         );
         let handle = stats_manager.handle();
@@ -533,14 +602,11 @@ mod tests {
             &node_info_from_id(0),
         )) as Arc<dyn RuntimeStats>;
         let throttle_interval = Duration::from_millis(50);
-        let stats_manager = RuntimeStatsManager::new_impl(
-            &tokio::runtime::Handle::current(),
-            "test_query_id".into(),
-            serde_json::Value::Null,
+        let stats_manager = make_stats_manager(
             vec![subscriber1, subscriber2],
-            None,
-            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat.clone()))]),
+            node_stat.clone(),
             throttle_interval,
+            "test_query_id",
             false,
         );
         let handle = stats_manager.handle();
@@ -584,18 +650,14 @@ mod tests {
             async fn on_exec_end(&self, _: QueryID) -> DaftResult<()> {
                 Ok(())
             }
-            async fn on_exec_operator_start(&self, _: QueryID, _: NodeID) -> DaftResult<()> {
+            async fn on_operator_start(&self, _: Arc<OperatorStartEvent>) -> DaftResult<()> {
                 Ok(())
             }
-            async fn on_exec_operator_end(&self, _: QueryID, _: NodeID) -> DaftResult<()> {
+            async fn on_operator_end(&self, _: Arc<OperatorEndEvent>) -> DaftResult<()> {
                 Ok(())
             }
 
-            async fn on_exec_emit_stats(
-                &self,
-                _: QueryID,
-                _: std::sync::Arc<Vec<(NodeID, Stats)>>,
-            ) -> DaftResult<()> {
+            async fn on_stats(&self, _: Arc<StatsEvent>) -> DaftResult<()> {
                 Err(common_error::DaftError::InternalError(
                     "Test error".to_string(),
                 ))
@@ -611,14 +673,11 @@ mod tests {
             &node_info_from_id(0),
         )) as Arc<dyn RuntimeStats>;
         let throttle_interval = Duration::from_millis(50);
-        let stats_manager = RuntimeStatsManager::new_impl(
-            &tokio::runtime::Handle::current(),
-            "test_query_id".into(),
-            serde_json::Value::Null,
+        let stats_manager = make_stats_manager(
             vec![failing_subscriber, mock_subscriber],
-            None,
-            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat.clone()))]),
+            node_stat.clone(),
             throttle_interval,
+            "test_query_id",
             false,
         );
         let handle = stats_manager.handle();
@@ -672,14 +731,11 @@ mod tests {
             &node_info_from_id(0),
         )) as Arc<dyn RuntimeStats>;
         let throttle_interval = Duration::from_millis(50);
-        let stats_manager = RuntimeStatsManager::new_impl(
-            &tokio::runtime::Handle::current(),
-            "test_query_id".into(),
-            serde_json::Value::Null,
+        let stats_manager = make_stats_manager(
             vec![mock_subscriber],
-            None,
-            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat.clone()))]),
+            node_stat.clone(),
             throttle_interval,
+            "test_ps_disabled",
             false,
         );
         let handle = stats_manager.handle();
@@ -710,14 +766,11 @@ mod tests {
             &Meter::test_scope("test_stats"),
             &node_info_from_id(0),
         )) as Arc<dyn RuntimeStats>;
-        let stats_manager = RuntimeStatsManager::new_impl(
-            &tokio::runtime::Handle::current(),
-            "test_query_id".into(),
-            serde_json::Value::Null,
+        let stats_manager = make_stats_manager(
             vec![mock_subscriber],
-            None,
-            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat.clone()))]),
+            node_stat.clone(),
             throttle_interval,
+            "test_ps_disabled",
             false,
         );
         let handle = stats_manager.handle();
@@ -791,17 +844,13 @@ mod tests {
         async fn on_exec_end(&self, _: QueryID) -> DaftResult<()> {
             Ok(())
         }
-        async fn on_exec_operator_start(&self, _: QueryID, _: NodeID) -> DaftResult<()> {
+        async fn on_operator_start(&self, _: Arc<OperatorStartEvent>) -> DaftResult<()> {
             Ok(())
         }
-        async fn on_exec_operator_end(&self, _: QueryID, _: NodeID) -> DaftResult<()> {
+        async fn on_operator_end(&self, _: Arc<OperatorEndEvent>) -> DaftResult<()> {
             Ok(())
         }
-        async fn on_exec_emit_stats(
-            &self,
-            _: QueryID,
-            _: Arc<Vec<(NodeID, Stats)>>,
-        ) -> DaftResult<()> {
+        async fn on_stats(&self, _: Arc<StatsEvent>) -> DaftResult<()> {
             Ok(())
         }
         async fn on_process_stats(&self, _: QueryID, _: Stats) -> DaftResult<()> {
@@ -820,15 +869,12 @@ mod tests {
             &node_info_from_id(0),
         )) as Arc<dyn RuntimeStats>;
 
-        let stats_manager = RuntimeStatsManager::new_impl(
-            &tokio::runtime::Handle::current(),
-            "test_ps_enabled".into(),
-            serde_json::Value::Null,
+        let stats_manager = make_stats_manager(
             vec![subscriber.clone()],
-            None,
-            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat))]),
+            node_stat.clone(),
             throttle_interval,
-            true, // enable process monitor
+            "test_ps_enabled",
+            true,
         );
 
         // Let a few ticks fire
@@ -852,17 +898,13 @@ mod tests {
             &node_info_from_id(0),
         )) as Arc<dyn RuntimeStats>;
 
-        let stats_manager = RuntimeStatsManager::new_impl(
-            &tokio::runtime::Handle::current(),
-            "test_ps_disabled".into(),
-            serde_json::Value::Null,
+        let stats_manager = make_stats_manager(
             vec![subscriber.clone()],
-            None,
-            HashMap::from([(0, (Arc::new(NodeInfo::default()), node_stat))]),
+            node_stat.clone(),
             throttle_interval,
-            false, // disable process monitor
+            "test_ps_disabled",
+            false,
         );
-
         // Let a few ticks fire
         sleep(Duration::from_millis(150)).await;
 
