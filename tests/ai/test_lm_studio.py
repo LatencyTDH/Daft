@@ -48,10 +48,10 @@ def test_lm_studio_supports_overriding_dimensions():
 
 def test_lm_studio_embed_text_returns_expression():
     """Test that embed_text() returns a Daft Expression."""
-    import daft
-
     from openai.types.create_embedding_response import CreateEmbeddingResponse
     from openai.types.embedding import Embedding as OpenAIEmbedding
+
+    import daft
 
     with patch("openai.resources.embeddings.Embeddings.create") as mock_embed:
         mock_embed.return_value = CreateEmbeddingResponse(
