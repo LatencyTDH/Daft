@@ -36,6 +36,24 @@ def _row_to_pydict(row: ray.data.row.TableRow | dict) -> dict:
     return row.as_pydict()
 
 
+@pytest.mark.parametrize("n_partitions", [1, 2])
+def test_to_ray_dataset_native_runner(n_partitions: int):
+    """Test that to_ray_dataset() works when using the native runner."""
+    df = daft.from_pydict(DATA).repartition(n_partitions)
+    df = df.with_column("floatcol", df["intcol"].cast(DataType.float64()))
+    ds = df.to_ray_dataset()
+
+    rows = sorted([_row_to_pydict(row) for row in ds.iter_rows()], key=lambda r: r["intcol"])
+    assert rows == sorted(
+        [
+            {"intcol": 1, "strcol": "a", "floatcol": 1.0},
+            {"intcol": 2, "strcol": "b", "floatcol": 2.0},
+            {"intcol": 3, "strcol": "c", "floatcol": 3.0},
+        ],
+        key=lambda r: r["intcol"],
+    )
+
+
 @pytest.mark.skipif(get_tests_daft_runner_name() != "ray", reason="Needs to run on Ray runner")
 @pytest.mark.parametrize("n_partitions", [1, 2])
 def test_to_ray_dataset_all_arrow(n_partitions: int):
