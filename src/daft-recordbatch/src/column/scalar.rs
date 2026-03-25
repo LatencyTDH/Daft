@@ -76,7 +76,7 @@ impl ScalarColumn {
         }
     }
 
-    fn to_series(&self) -> Series {
+    pub fn to_series(&self) -> Series {
         Self::_to_series(&self.name, &self.scalar, &self.dtype, self.length)
     }
 
