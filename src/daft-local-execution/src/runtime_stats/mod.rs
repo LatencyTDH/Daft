@@ -244,7 +244,7 @@ impl RuntimeStatsManager {
                             }
 
                             let Some(operator_meta) = operators.get(&node_id) else {
-                                log::warn!("Unknown node_id {node_id} in operators during activate, skipping subscriber notification");
+                                log::warn!("Unknown node_id {node_id} in operators during on_start, skipping subscriber notification");
                                 continue;
                             };
 
@@ -429,8 +429,7 @@ mod tests {
     use async_trait::async_trait;
     use common_error::DaftResult;
     use common_metrics::{
-        DURATION_KEY, Meter, NodeID, QueryPlan, ROWS_IN_KEY, ROWS_OUT_KEY, Stat, StatSnapshot,
-        Stats,
+        DURATION_KEY, Meter, QueryPlan, ROWS_IN_KEY, ROWS_OUT_KEY, Stat, StatSnapshot, Stats,
     };
     use daft_context::{QueryMetadata, QueryResult, Subscriber};
     use daft_micropartition::MicroPartitionRef;
