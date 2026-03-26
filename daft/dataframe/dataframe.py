@@ -1378,7 +1378,7 @@ class DataFrame:
             table (Union[str, pathlib.Path, deltalake.DeltaTable, UnityCatalogTable]): Destination [Delta Lake Table](https://delta-io.github.io/delta-rs/api/delta_table/) or table URI to write dataframe to.
             partition_cols (List[str], optional): How to subpartition each partition further. If table exists, expected to match table's existing partitioning scheme, otherwise creates the table with specified partition columns. Defaults to None.
             mode (str, optional): Operation mode of the write. `append` will add new data, `overwrite` will replace table with new data, `error` will raise an error if table already exists, and `ignore` will not write anything if table already exists. Defaults to `append`.
-            schema_mode (str, optional): Schema mode of the write. If set to `overwrite`, allows replacing the schema of the table when doing `mode=overwrite`. Schema mode `merge` is currently not supported.
+            schema_mode (str, optional): Schema mode of the write. If set to `overwrite`, allows replacing the schema of the table when doing `mode=overwrite`. If set to `merge`, merges the incoming schema into the existing table schema, preserving existing columns and adding any new columns.
             name (str, optional): User-provided identifier for this table.
             description (str, optional): User-provided description for this table.
             configuration (Mapping[str, Optional[str]], optional): A map containing configuration options for the metadata action.
@@ -1412,6 +1412,7 @@ class DataFrame:
         from daft.io.delta_lake._deltalake import delta_schema_to_pyarrow
         from daft.io.delta_lake.delta_lake_write import (
             AddAction,
+            DeltaJSONEncoder,
             convert_pa_schema_to_delta,
             create_table_with_add_actions,
         )
@@ -1433,8 +1434,194 @@ class DataFrame:
 
                 return CommitProperties(custom_metadata=metadata)
 
-        if schema_mode == "merge":
-            raise ValueError("Schema mode' merge' is not currently supported for write_deltalake.")
+        def _schema_to_pyarrow(schema: Schema) -> "pyarrow.Schema":
+            return pa.schema((field.name, field.dtype.to_arrow_dtype()) for field in schema)
+
+        def _add_actions_to_dict(actions: Any | None) -> dict[str, list[Any]]:
+            if actions is None:
+                return {"path": [], "num_records": [], "size_bytes": []}
+            record_batch = pa.record_batch(actions)
+            if record_batch.num_rows == 0:
+                return {"path": [], "num_records": [], "size_bytes": []}
+            return record_batch.to_pydict()
+
+        def _build_write_result_from_active_actions(
+            current_actions: dict[str, list[Any]],
+            previous_actions: dict[str, list[Any]] | None = None,
+            mode: str = "append",
+        ) -> DataFrame:
+            previous_actions = previous_actions or {"path": [], "num_records": [], "size_bytes": []}
+            previous_paths = set(previous_actions["path"])
+            current_by_path = {
+                path: (num_records, size_bytes)
+                for path, num_records, size_bytes in zip(
+                    current_actions["path"], current_actions["num_records"], current_actions["size_bytes"]
+                )
+            }
+
+            operations = []
+            paths = []
+            rows = []
+            sizes = []
+
+            for path in current_actions["path"]:
+                if path in previous_paths:
+                    continue
+                num_records, size_bytes = current_by_path[path]
+                operations.append("ADD")
+                paths.append(path)
+                rows.append(num_records)
+                sizes.append(size_bytes)
+
+            if mode == "overwrite":
+                for path, num_records, size_bytes in zip(
+                    previous_actions["path"], previous_actions["num_records"], previous_actions["size_bytes"]
+                ):
+                    operations.append("DELETE")
+                    paths.append(path)
+                    rows.append(num_records)
+                    sizes.append(size_bytes)
+
+            return from_pydict(
+                {
+                    "operation": pa.array(operations, type=pa.string()),
+                    "rows": pa.array(rows, type=pa.int64()),
+                    "file_size": pa.array(sizes, type=pa.int64()),
+                    "file_name": pa.array([os.path.basename(fp) for fp in paths], type=pa.string()),
+                }
+            )
+
+        def _merge_table_and_incoming_schema(
+            existing_table_schema: "pyarrow.Schema",
+            incoming_schema: Schema,
+        ) -> "pyarrow.Schema":
+            existing_column_names = set(existing_table_schema.names)
+            merged_fields = list(existing_table_schema)
+            merged_fields.extend(
+                pa.field(field.name, field.dtype.to_arrow_dtype())
+                for field in incoming_schema
+                if field.name not in existing_column_names
+            )
+            return pa.schema(merged_fields)
+
+        def _coerce_df_to_schema(
+            df: DataFrame,
+            target_schema: "pyarrow.Schema",
+        ) -> tuple[DataFrame, list[tuple[str, DataType, DataType]]]:
+            incoming_schema = df.schema()
+            incoming_column_names = set(incoming_schema.column_names())
+
+            projection = []
+            casts_to_validate = []
+            for field in target_schema:
+                target_dtype = DataType.from_arrow_type(field.type)
+                if field.name in incoming_column_names:
+                    expr = col(field.name)
+                    source_dtype = incoming_schema[field.name].dtype
+                    if source_dtype != target_dtype:
+                        expr = expr.cast(target_dtype)
+                        casts_to_validate.append((field.name, source_dtype, target_dtype))
+                else:
+                    expr = lit(None).cast(target_dtype)
+                projection.append(expr.alias(field.name))
+
+            return df.select(*projection), casts_to_validate
+
+        def _validate_schema_merge_casts(
+            df: DataFrame,
+            casts_to_validate: list[tuple[str, DataType, DataType]],
+        ) -> None:
+            for column_name, source_dtype, target_dtype in casts_to_validate:
+                invalid_rows = df.where(
+                    (~col(column_name).is_null()) & col(column_name).cast(target_dtype).is_null()
+                ).limit(1)
+                if invalid_rows.count_rows() > 0:
+                    raise ValueError(
+                        "Cannot cast "
+                        f"{str(source_dtype).lower()} to {str(target_dtype).lower()} "
+                        f"for Delta Lake schema merge column '{column_name}'"
+                    )
+
+        def _partition_values_from_path(path: str) -> dict[str, str | None]:
+            import urllib.parse
+
+            partition_values = {}
+            for part in pathlib.PurePosixPath(path).parts[:-1]:
+                if "=" not in part:
+                    continue
+                raw_key, raw_value = part.split("=", 1)
+                key = urllib.parse.unquote(raw_key)
+                value = None if raw_value == "__HIVE_DEFAULT_PARTITION__" else urllib.parse.unquote(raw_value)
+                partition_values[key] = value
+            return partition_values
+
+        def _get_existing_add_actions_for_schema_merge_append(
+            table: "deltalake.DeltaTable",
+        ) -> list[AddAction] | None:
+            active_actions = pa.record_batch(table.get_add_actions())
+            supported_fields = {
+                "path",
+                "size",
+                "size_bytes",
+                "modification_time",
+                "data_change",
+                "stats",
+                "num_records",
+                "null_count",
+                "min",
+                "max",
+                "partition",
+                "partition_values",
+            }
+            if any(field_name not in supported_fields for field_name in active_actions.schema.names):
+                return None
+
+            active_actions_dict = active_actions.to_pydict()
+            size_field = "size_bytes" if "size_bytes" in active_actions_dict else "size"
+            if size_field not in active_actions_dict or "modification_time" not in active_actions_dict:
+                return None
+
+            if "stats" in active_actions_dict:
+                stats_values = active_actions_dict["stats"]
+            elif all(field_name in active_actions_dict for field_name in ("num_records", "null_count", "min", "max")):
+                stats_values = [
+                    json.dumps(
+                        {
+                            "numRecords": num_records,
+                            "minValues": min_values,
+                            "maxValues": max_values,
+                            "nullCount": null_count,
+                        },
+                        cls=DeltaJSONEncoder,
+                    )
+                    for num_records, null_count, min_values, max_values in zip(
+                        active_actions_dict["num_records"],
+                        active_actions_dict["null_count"],
+                        active_actions_dict["min"],
+                        active_actions_dict["max"],
+                    )
+                ]
+            else:
+                return None
+
+            data_change_values = active_actions_dict.get("data_change", [True] * active_actions.num_rows)
+            return [
+                AddAction(
+                    path=path,
+                    size=size,
+                    partition_values=_partition_values_from_path(path),
+                    modification_time=modification_time,
+                    data_change=data_change,
+                    stats=stats,
+                )
+                for path, size, modification_time, data_change, stats in zip(
+                    active_actions_dict["path"],
+                    active_actions_dict[size_field],
+                    active_actions_dict["modification_time"],
+                    data_change_values,
+                    stats_values,
+                )
+            ]
 
         if parse(deltalake.__version__) < parse("0.14.0"):
             raise ValueError(f"Write delta lake is only supported on deltalake>=0.14.0, found {deltalake.__version__}")
@@ -1487,10 +1674,15 @@ class DataFrame:
             if allow_unsafe_rename:
                 storage_options["MOUNT_ALLOW_UNSAFE_RENAME"] = "true"
 
-        pyarrow_schema = pa.schema((f.name, f.dtype.to_arrow_dtype()) for f in self.schema())
+        df_to_write = self
+        pyarrow_schema = _schema_to_pyarrow(df_to_write.schema())
 
         large_dtypes = True
         delta_schema = convert_pa_schema_to_delta(pyarrow_schema, large_dtypes=large_dtypes)
+        table_schema: pyarrow.Schema | None = None
+        casts_to_validate: list[tuple[str, DataType, DataType]] = []
+        merge_updates_table_schema = False
+        existing_add_actions_for_schema_merge_append: list[AddAction] | None = None
 
         if table:
             if partition_cols and partition_cols != table.metadata().partition_columns:
@@ -1503,8 +1695,10 @@ class DataFrame:
             table.update_incremental()
 
             table_schema = delta_schema_to_pyarrow(table.schema())
-            if Schema.from_pyarrow_schema(delta_schema) != Schema.from_pyarrow_schema(table_schema) and not (
-                mode == "overwrite" and schema_mode == "overwrite"
+            if (
+                schema_mode != "merge"
+                and Schema.from_pyarrow_schema(delta_schema) != Schema.from_pyarrow_schema(table_schema)
+                and not (mode == "overwrite" and schema_mode == "overwrite")
             ):
                 raise ValueError(
                     "Schema of data does not match table schema\n"
@@ -1521,16 +1715,79 @@ class DataFrame:
                         "file_name": pa.array([], type=pa.string()),
                     }
                 )
+
+            if schema_mode == "merge":
+                merged_schema = _merge_table_and_incoming_schema(table_schema, self.schema())
+                df_to_write, casts_to_validate = _coerce_df_to_schema(self, merged_schema)
+                pyarrow_schema = _schema_to_pyarrow(df_to_write.schema())
+                delta_schema = convert_pa_schema_to_delta(pyarrow_schema, large_dtypes=large_dtypes)
+                merge_updates_table_schema = Schema.from_pyarrow_schema(delta_schema) != Schema.from_pyarrow_schema(
+                    table_schema
+                )
+                if mode == "append" and merge_updates_table_schema:
+                    # delta-rs' low-level append transaction API ignores schema updates, so the native
+                    # single-commit path has to rewrite the active snapshot as overwrite(old + new).
+                    # This is only safe when the public Python surface lets us round-trip every active
+                    # AddAction field that matters to the commit. Today the Python AddAction type only
+                    # carries path/size/partition_values/modification_time/data_change/stats, while
+                    # DeltaTable.get_add_actions() may surface richer fields (for example tags) that we
+                    # cannot faithfully feed back through create_write_transaction(). In those cases we
+                    # must fall back to delta-rs' centralized writer, which can still do schema merge in
+                    # one commit without reconstructing the existing snapshot in Python.
+                    existing_add_actions_for_schema_merge_append = _get_existing_add_actions_for_schema_merge_append(
+                        table
+                    )
+
             version = table.version() + 1
         else:
             version = 0
 
         if partition_cols is not None:
             for c in partition_cols:
-                if self.schema()[c].dtype == DataType.binary():
+                if df_to_write.schema()[c].dtype == DataType.binary():
                     raise NotImplementedError("Binary partition columns are not yet supported for Delta Lake writes")
 
-        builder = self._builder.write_deltalake(
+        if casts_to_validate:
+            _validate_schema_merge_casts(self, casts_to_validate)
+
+        if (
+            table is not None
+            and mode == "append"
+            and schema_mode == "merge"
+            and merge_updates_table_schema
+            and existing_add_actions_for_schema_merge_append is None
+        ):
+            from deltalake.writer import write_deltalake as deltalake_write
+
+            previous_actions = _add_actions_to_dict(table.get_add_actions())
+
+            writer_kwargs: dict[str, Any] = {
+                "partition_by": partition_cols,
+                "mode": mode,
+                "name": name,
+                "description": description,
+                "configuration": configuration,
+                "schema_mode": schema_mode,
+                "storage_options": storage_options,
+            }
+            if parse(deltalake.__version__) < parse("0.20.0"):
+                writer_kwargs["custom_metadata"] = custom_metadata
+            else:
+                writer_kwargs["commit_properties"] = _create_metadata_param(custom_metadata)
+            if parse(deltalake.__version__) < parse("1.0.0"):
+                writer_kwargs["large_dtypes"] = large_dtypes
+
+            arrow_batch_reader = pa.RecordBatchReader.from_batches(
+                pyarrow_schema,
+                df_to_write.to_arrow_iter(results_buffer_size=None),
+            )
+            deltalake_write(table, arrow_batch_reader, **writer_kwargs)
+
+            result_table = deltalake.DeltaTable(table_uri, storage_options=storage_options)
+            current_actions = _add_actions_to_dict(result_table.get_add_actions())
+            return _build_write_result_from_active_actions(current_actions, previous_actions, mode=mode)
+
+        builder = df_to_write._builder.write_deltalake(
             table_uri,
             mode,
             version,
@@ -1580,15 +1837,28 @@ class DataFrame:
                     rows.append(old_actions_dict["num_records"][i])
                     sizes.append(old_actions_dict["size_bytes"][i])
 
+            transaction_add_actions = add_actions
+            transaction_mode = mode
+            if existing_add_actions_for_schema_merge_append is not None:
+                # Emulate append-with-schema-evolution as a single transaction by atomically
+                # replacing the active snapshot with existing files + newly written files.
+                transaction_add_actions = [*existing_add_actions_for_schema_merge_append, *add_actions]
+                transaction_mode = "overwrite"
+
             metadata_param = _create_metadata_param(custom_metadata)
             if parse(deltalake.__version__) < parse("1.0.0"):
                 table._table.create_write_transaction(
-                    add_actions, mode, partition_cols or [], delta_schema, None, metadata_param
+                    transaction_add_actions,
+                    transaction_mode,
+                    partition_cols or [],
+                    delta_schema,
+                    None,
+                    metadata_param,
                 )
             else:
                 table._table.create_write_transaction(
-                    add_actions,
-                    mode,
+                    transaction_add_actions,
+                    transaction_mode,
                     partition_cols or [],
                     deltalake.Schema.from_arrow(delta_schema),
                     None,

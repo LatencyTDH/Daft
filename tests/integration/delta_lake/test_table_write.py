@@ -172,6 +172,226 @@ def test_deltalake_write_overwrite_error_schema(tmp_path):
         df2.write_deltalake(str(path), mode="overwrite")
 
 
+def test_deltalake_write_append_schema_merge_add_column(tmp_path):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+    deltalake.write_deltalake(str(path), pa.table({"a": [1, 2]}))
+
+    df2 = daft.from_pydict({"a": [3, 4], "b": ["x", "y"]})
+    result = df2.write_deltalake(str(path), schema_mode="merge")
+    result = result.to_pydict()
+    assert result["operation"] == ["ADD"]
+    assert result["rows"] == [2]
+
+    read_delta = deltalake.DeltaTable(str(path))
+    assert read_delta.version() == 1
+    assert Schema.from_pyarrow_schema(pa.schema(read_delta.schema().to_arrow())) == Schema.from_pyarrow_schema(
+        pa.schema([("a", pa.int64()), ("b", pa.string())])
+    )
+    assert sorted(read_delta.to_pyarrow_table().to_pylist(), key=lambda row: row["a"]) == [
+        {"a": 1, "b": None},
+        {"a": 2, "b": None},
+        {"a": 3, "b": "x"},
+        {"a": 4, "b": "y"},
+    ]
+
+
+def test_deltalake_write_append_schema_merge_missing_existing_column(tmp_path):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+    deltalake.write_deltalake(str(path), pa.table({"a": [1, 2]}))
+
+    df2 = daft.from_pydict({"b": ["x", "y"]})
+    result = df2.write_deltalake(str(path), schema_mode="merge")
+    result = result.to_pydict()
+    assert result["operation"] == ["ADD"]
+    assert result["rows"] == [2]
+
+    read_delta = deltalake.DeltaTable(str(path))
+    assert Schema.from_pyarrow_schema(pa.schema(read_delta.schema().to_arrow())) == Schema.from_pyarrow_schema(
+        pa.schema([("a", pa.int64()), ("b", pa.string())])
+    )
+    assert sorted(
+        read_delta.to_pyarrow_table().to_pylist(),
+        key=lambda row: (row["a"] is None, row["a"] if row["a"] is not None else row["b"]),
+    ) == [
+        {"a": 1, "b": None},
+        {"a": 2, "b": None},
+        {"a": None, "b": "x"},
+        {"a": None, "b": "y"},
+    ]
+
+
+def test_deltalake_write_append_schema_merge_cast_existing_column_type(tmp_path):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+    deltalake.write_deltalake(str(path), pa.table({"a": [1, 2]}))
+
+    df2 = daft.from_pydict({"a": ["3", "4"]})
+    result = df2.write_deltalake(str(path), schema_mode="merge")
+    result = result.to_pydict()
+    assert result["operation"] == ["ADD"]
+    assert result["rows"] == [2]
+
+    read_delta = deltalake.DeltaTable(str(path))
+    expected_schema = Schema.from_pyarrow_schema(pa.schema(read_delta.schema().to_arrow()))
+    assert expected_schema == Schema.from_pyarrow_schema(pa.schema([("a", pa.int64())]))
+    assert sorted(read_delta.to_pyarrow_table().to_pylist(), key=lambda row: row["a"]) == [
+        {"a": 1},
+        {"a": 2},
+        {"a": 3},
+        {"a": 4},
+    ]
+
+
+def test_deltalake_write_overwrite_schema_merge_preserves_existing_columns(tmp_path):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+    deltalake.write_deltalake(str(path), pa.table({"a": [1, 2]}))
+
+    df2 = daft.from_pydict({"b": ["x", "y"]})
+    result = df2.write_deltalake(str(path), mode="overwrite", schema_mode="merge")
+    result = result.to_pydict()
+    assert result["operation"] == ["ADD", "DELETE"]
+    assert result["rows"] == [2, 2]
+
+    read_delta = deltalake.DeltaTable(str(path))
+    assert read_delta.version() == 1
+    assert Schema.from_pyarrow_schema(pa.schema(read_delta.schema().to_arrow())) == Schema.from_pyarrow_schema(
+        pa.schema([("a", pa.int64()), ("b", pa.string())])
+    )
+    assert sorted(read_delta.to_pyarrow_table().to_pylist(), key=lambda row: row["b"]) == [
+        {"a": None, "b": "x"},
+        {"a": None, "b": "y"},
+    ]
+
+
+def test_deltalake_write_append_schema_merge_add_column_partitioned(tmp_path):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+
+    df1 = daft.from_pydict({"part": [1, 2], "a": [1, 2]})
+    deltalake.write_deltalake(str(path), df1.to_arrow(), partition_by=["part"])
+
+    df2 = daft.from_pydict({"part": [1, 2], "a": [3, 4], "b": ["x", "y"]})
+    result = df2.write_deltalake(str(path), schema_mode="merge")
+    result = result.to_pydict()
+    assert result["operation"] == ["ADD", "ADD"]
+    assert sorted(result["rows"]) == [1, 1]
+
+    expected = daft.from_pydict(
+        {
+            "part": [1, 2, 1, 2],
+            "a": [1, 2, 3, 4],
+            "b": [None, None, "x", "y"],
+        }
+    )
+    read_delta = deltalake.DeltaTable(str(path))
+    assert read_delta.version() == 1
+    assert Schema.from_pyarrow_schema(pa.schema(read_delta.schema().to_arrow())) == expected.schema()
+    check_equal_both_daft_and_delta_rs(expected, path, [("part", "ascending"), ("a", "ascending")])
+
+
+@pytest.mark.skipif(
+    get_tests_daft_runner_name() == "native",
+    reason="Native executor does not support repartitioning",
+)
+def test_deltalake_write_append_schema_merge_distributed_partitioned_cast_missing_and_additive(tmp_path):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+
+    base = pa.table(
+        {
+            "part": pa.array([0, 1], type=pa.int64()),
+            "a": pa.array([1, 2], type=pa.int64()),
+            "existing_only": pa.array(["left", "right"], type=pa.string()),
+        }
+    )
+    deltalake.write_deltalake(str(path), base, partition_by=["part"])
+
+    df = (
+        daft.range(64, partitions=16)
+        .with_columns(
+            {
+                "part": daft.col("id") % 8,
+                "a": (daft.col("id") + 10).cast(daft.DataType.string()),
+                "new_value": daft.col("id") * 2,
+            }
+        )
+        .select("part", "a", "new_value")
+        .into_partitions(32)
+    )
+
+    result = df.write_deltalake(str(path), schema_mode="merge").to_pydict()
+    assert set(result["operation"]) == {"ADD"}
+    assert len(result["operation"]) > 1
+    assert sum(result["rows"]) == 64
+
+    expected_base = (
+        daft.from_arrow(base)
+        .with_columns({"new_value": daft.lit(None).cast(daft.DataType.int64())})
+        .select("part", "a", "existing_only", "new_value")
+    )
+    expected_append = df.with_columns(
+        {
+            "a": daft.col("a").cast(daft.DataType.int64()),
+            "existing_only": daft.lit(None).cast(daft.DataType.string()),
+        }
+    ).select("part", "a", "existing_only", "new_value")
+    expected = expected_base.concat(expected_append)
+
+    read_delta = deltalake.DeltaTable(str(path))
+    assert read_delta.version() == 1
+    assert Schema.from_pyarrow_schema(pa.schema(read_delta.schema().to_arrow())) == expected.schema()
+    check_equal_both_daft_and_delta_rs(expected, path, [("part", "ascending"), ("a", "ascending")])
+
+
+def test_deltalake_write_append_schema_merge_falls_back_when_active_actions_are_unsupported(tmp_path, monkeypatch):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+    deltalake.write_deltalake(str(path), pa.table({"a": [1, 2]}))
+
+    original_get_add_actions = deltalake.DeltaTable.get_add_actions
+
+    def patched_get_add_actions(self, flatten: bool = False):
+        record_batch = pa.record_batch(original_get_add_actions(self, flatten=flatten))
+        extra = pa.array(["present"] * record_batch.num_rows, type=pa.string())
+        return pa.RecordBatch.from_arrays(
+            [*record_batch.columns, extra],
+            names=[*record_batch.schema.names, "tags"],
+        )
+
+    monkeypatch.setattr(deltalake.DeltaTable, "get_add_actions", patched_get_add_actions)
+
+    df2 = daft.from_pydict({"a": [3, 4], "b": ["x", "y"]})
+    result = df2.write_deltalake(str(path), schema_mode="merge").to_pydict()
+    assert result["operation"] == ["ADD"]
+    assert result["rows"] == [2]
+
+    read_delta = deltalake.DeltaTable(str(path))
+    assert read_delta.version() == 1
+    assert Schema.from_pyarrow_schema(pa.schema(read_delta.schema().to_arrow())) == Schema.from_pyarrow_schema(
+        pa.schema([("a", pa.int64()), ("b", pa.string())])
+    )
+    assert sorted(read_delta.to_pyarrow_table().to_pylist(), key=lambda row: row["a"]) == [
+        {"a": 1, "b": None},
+        {"a": 2, "b": None},
+        {"a": 3, "b": "x"},
+        {"a": 4, "b": "y"},
+    ]
+    assert read_delta.history(1)[0]["operationParameters"]["mode"] == "Append"
+
+
+def test_deltalake_write_schema_merge_raises_on_invalid_cast(tmp_path):
+    deltalake = pytest.importorskip("deltalake")
+    path = tmp_path / "some_table"
+    deltalake.write_deltalake(str(path), pa.table({"a": [1, 2]}))
+
+    df = daft.from_pydict({"a": ["x", "y"]})
+    with pytest.raises(Exception, match="Cannot cast string"):
+        df.write_deltalake(str(path), schema_mode="merge")
+
+
 def test_deltalake_write_error(tmp_path, base_table):
     path = tmp_path / "some_table"
     df = daft.from_arrow(base_table)
