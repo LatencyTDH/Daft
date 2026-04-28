@@ -1,59 +1,130 @@
 # Distributed Delta Lake Merge in Daft
 
-## Overview
+## Summary
 
-Delta Lake MERGE allows users to update, delete, and insert data into an existing Delta table based on a source DataFrame. This document outlines the architecture for supporting truly distributed Delta MERGE operations in Daft, ensuring that source rows are processed in a distributed manner without being collected on the driver.
+Daft now supports a first distributed Delta Lake MERGE path through
+`DataFrame.write_deltalake(..., mode="merge", ...)`. The implementation keeps
+Daft source rows in the normal write pipeline, stages them as a temporary Delta
+table, and then gives delta-rs a streaming Arrow reader over that staged table.
+The driver coordinates the target transaction, but it does not materialize the
+source DataFrame with `to_arrow()` or `to_pydict()` before merge execution.
 
-## Goals
-- Support `DataFrame.write_deltalake(..., mode="merge", merge_condition=..., when_matched_update=..., ...)` with standard Delta MERGE semantics.
-- Process source rows in a distributed fashion (e.g., via Ray workers or native distributed runners).
-- Prevent Out-Of-Memory (OOM) issues on the driver by only collecting compact Delta transaction metadata (`AddAction` and `RemoveAction`).
-- Preserve backwards compatibility for `append`, `overwrite`, `error`, and `ignore` write modes.
+This is intentionally a staged-source implementation rather than a fake
+`schema_mode="merge"` relaxation. `schema_mode` remains schema evolution
+terminology; `mode="merge"` is the Delta MERGE/upsert operation.
 
-## Non-Goals
-- Full schema evolution during MERGE (to be handled in a separate design).
-- Handling extremely large transaction metadata payloads (Delta transaction metadata must fit in driver memory, which is standard).
+## Public API
 
-## Architecture: Distributed MERGE Execution
+`DataFrame.write_deltalake` accepts `mode="merge"` plus explicit merge clauses:
 
-Since `deltalake` (delta-rs) 1.5 exposes `DeltaTable.merge(source, predicate, streamed_exec=True)`, passing a local ArrowStreamExportable works well for single-node workloads. However, for a distributed execution, we cannot collect the distributed Daft DataFrame into a single driver-side Arrow stream.
-
-### Proposed Strategy: The Anti-Join and Distributed Rewrite Method
-
-A true distributed MERGE can be modeled as a distributed join and rewrite operation:
-
-1. **File Skipping & Target Scanning:** Evaluate the `merge_condition` using statistics from the target Delta table's transaction log to prune target Parquet files that definitely do not overlap with the source DataFrame.
-2. **Target File Read:** Read the remaining target Parquet files as a distributed Daft DataFrame.
-3. **Distributed Join & Evaluate:** Perform a distributed full outer join (or similar, depending on MERGE clauses) between the target DataFrame and the source DataFrame on the `merge_condition`.
-4. **Apply Actions:** For each joined row, evaluate the `when_matched_update`, `when_matched_delete`, and `when_not_matched_insert` conditions and expressions to compute the new row values (or filter out deleted rows).
-5. **Distributed Write:** Write the resulting rows to new Parquet files in a distributed manner, generating `AddAction` objects.
-6. **Transaction Commit:** Send the `AddAction` objects (for new files) and `RemoveAction` objects (for the old target files that were rewritten) to the driver. The driver then atomically commits these actions to the Delta log using `deltalake`'s low-level commit APIs.
-
-### Alternative Strategy: Staging Table (Evaluated)
-
-An alternative is to write the source DataFrame to a temporary staging Delta table using the existing distributed write path, and then invoke a target-side merge reading from the staging table. However, delta-rs typically still needs to read the source table into memory or a stream to perform the join. Unless delta-rs pushes the join into a distributed query engine (which it does not by default), this still bottlenecks on the machine executing the merge. Therefore, the Distributed Join & Rewrite method is superior.
-
-## API Changes
-
-`DataFrame.write_deltalake` will be extended:
 ```python
-def write_deltalake(
-    self,
-    target: str | Path | deltalake.DeltaTable,
-    mode: Literal["append", "overwrite", "error", "ignore", "merge"] = "append",
-    *,
-    merge_condition: Optional[Expression] = None,
-    when_matched_update: Optional[Dict[str, Expression]] = None,
-    when_matched_delete: Optional[Expression] = None,
-    when_not_matched_insert: Optional[Dict[str, Expression]] = None,
-    # ... existing parameters ...
-): ...
+df.write_deltalake(
+    target_path,
+    mode="merge",
+    merge_predicate="target.id = source.id",
+    merge_when_matched_update_all=True,
+    merge_when_not_matched_insert_all=True,
+)
 ```
 
-## Validation and Concurrency
-- **Concurrency:** Delta Lake's optimistic concurrency control applies. If concurrent transactions modify the same target files, the transaction must be retried or failed.
-- **Distributed Guarantee:** We must include assertions in our test suite (e.g., using Ray worker mocking or analyzing memory/network usage) to ensure the driver node never loads the full source DataFrame.
+Supported clauses in this phase:
 
-## Limitations and Future Work
-- Row-level tracking: Naively rewriting entire target files may cause write amplification. We will explore advanced pruning or Deletion Vectors in the future.
-- Complex MERGE predicates might not map cleanly to equi-joins, requiring broadcast nested loop joins which are expensive.
+- `merge_when_matched_update_all=True`
+- `merge_when_matched_updates={"col": "source.expr"}`
+- `merge_when_matched_delete=<optional predicate>`
+- `merge_when_not_matched_insert_all=True`
+- `merge_when_not_matched_insert={"col": "source.expr"}`
+- `merge_source_alias` and `merge_target_alias` for SQL predicate/expression aliases
+
+The API rejects ambiguous combinations such as update-all plus explicit update
+assignments. It also rejects `schema_mode="merge"` with a message pointing users
+to `mode="merge"`, because schema merging and Delta MERGE are different
+operations.
+
+## Execution Architecture
+
+### 1. Validate and bind the target table
+
+The target table must already exist. Daft validates that the source schema
+matches the target schema unless the existing overwrite schema rule applies.
+Merge does not create tables.
+
+### 2. Distributed source staging
+
+The source DataFrame is written to a temporary sibling Delta table via Daft's
+existing `write_deltalake` execution path:
+
+```text
+source Daft plan -> distributed sink tasks -> staged Delta table AddActions ->
+staged Delta commit
+```
+
+This reuses the production writer machinery that already writes source
+micropartitions on workers and returns only compact Delta add-action metadata to
+the coordinator. Source rows are not collected on the Python driver.
+
+### 3. Streaming merge input
+
+After staging commits, Daft opens the staged Delta table and builds a PyArrow
+`RecordBatchReader` from `DeltaTable.to_pyarrow_dataset().scanner().to_reader()`.
+That reader exposes Arrow's C stream interface, which delta-rs 1.5 accepts in
+`DeltaTable.merge(..., streamed_exec=True)`. This avoids constructing a single
+driver-side Arrow table for the merge source.
+
+### 4. Target transaction
+
+Delta-rs performs the MERGE against the target table, including file scanning,
+rewrites, optimistic concurrency control, and Delta log commit. Daft passes
+custom commit metadata through the delta-rs `CommitProperties` path.
+
+### 5. Cleanup
+
+For local filesystems, Daft removes the temporary staging table after the target
+merge succeeds or fails. Remote-object-store cleanup is intentionally left for a
+follow-up because safe recursive deletion needs object-store-specific handling
+and should not be implemented with broad best-effort filesystem assumptions.
+
+## Distributed Guarantees
+
+- Source execution and staging are distributed using Daft's existing sink
+  pipeline.
+- The driver collects staged add-action metadata and merge metrics only.
+- The merge source is provided to delta-rs as a `RecordBatchReader` stream, not
+  as a driver-collected `pyarrow.Table`.
+- Target-side merge execution is currently performed by delta-rs in the process
+  coordinating the transaction. That is acceptable for this phase because the
+  source is streamed and spill-aware (`streamed_exec=True`), but it is not the
+  final lowest-write-amplification architecture.
+
+## Limitations and Follow-ups
+
+This phase deliberately chooses a safe staged-source merge over directly
+rewriting target files in Daft. Remaining work for a fully native Daft merge
+engine:
+
+1. Represent merge clauses in the logical/physical plan instead of using a
+   blocking Python wrapper.
+2. Use Delta log statistics plus source-domain statistics to prune target files
+   before scan.
+3. Execute target/source joins in Daft workers and generate `RemoveAction` plus
+   `AddAction` records directly.
+4. Add remote staging cleanup through Daft object-store abstractions.
+5. Support schema evolution during merge.
+
+## Concurrency Semantics
+
+The target commit is delegated to delta-rs, so Delta Lake optimistic concurrency
+control applies. If a concurrent writer modifies files that the merge read or
+rewrote, delta-rs raises the appropriate transaction conflict rather than Daft
+silently corrupting the table.
+
+## Test Plan
+
+Coverage should include:
+
+- update+insert correctness for `update_all` and `insert_all`;
+- explicit update/insert assignment clauses;
+- argument validation for missing predicates and ambiguous clauses;
+- local staging cleanup;
+- distributed-runner coverage showing repartitioned sources flow through the
+  staging write path before delta-rs merge execution.

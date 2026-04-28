@@ -10,6 +10,8 @@ import logging
 import multiprocessing
 import os
 import pathlib
+import shutil
+import tempfile
 import typing
 import warnings
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -17,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial, reduce
 from typing import TYPE_CHECKING, Any, Concatenate, Literal, ParamSpec, TypeVar, Union, overload
+from uuid import uuid4
 
 from daft.api_annotations import DataframePublicAPI
 from daft.context import get_context
@@ -1426,8 +1429,16 @@ class DataFrame:
         self,
         table: Union[str, pathlib.Path, "deltalake.DeltaTable", "UnityCatalogTable"],
         partition_cols: list[str] | None = None,
-        mode: Literal["append", "overwrite", "error", "ignore"] = "append",
+        mode: Literal["append", "overwrite", "error", "ignore", "merge"] = "append",
         schema_mode: Literal["merge", "overwrite"] | None = None,
+        merge_predicate: str | None = None,
+        merge_source_alias: str | None = "source",
+        merge_target_alias: str | None = "target",
+        merge_when_matched_update_all: bool = False,
+        merge_when_not_matched_insert_all: bool = False,
+        merge_when_matched_updates: Mapping[str, str] | None = None,
+        merge_when_matched_delete: str | None = None,
+        merge_when_not_matched_insert: Mapping[str, str] | None = None,
         name: str | None = None,
         description: str | None = None,
         configuration: Mapping[str, str | None] | None = None,
@@ -1442,8 +1453,16 @@ class DataFrame:
         Args:
             table (Union[str, pathlib.Path, deltalake.DeltaTable, UnityCatalogTable]): Destination [Delta Lake Table](https://delta-io.github.io/delta-rs/api/delta_table/) or table URI to write dataframe to.
             partition_cols (List[str], optional): How to subpartition each partition further. If table exists, expected to match table's existing partitioning scheme, otherwise creates the table with specified partition columns. Defaults to None.
-            mode (str, optional): Operation mode of the write. `append` will add new data, `overwrite` will replace table with new data, `error` will raise an error if table already exists, and `ignore` will not write anything if table already exists. Defaults to `append`.
-            schema_mode (str, optional): Schema mode of the write. If set to `overwrite`, allows replacing the schema of the table when doing `mode=overwrite`. Schema mode `merge` is currently not supported.
+            mode (str, optional): Operation mode of the write. `append` will add new data, `overwrite` will replace table with new data, `error` will raise an error if table already exists, `ignore` will not write anything if table already exists, and `merge` will merge rows into an existing Delta table. Defaults to `append`.
+            schema_mode (str, optional): Schema mode of the write. If set to `overwrite`, allows replacing the schema of the table when doing `mode=overwrite`. Schema mode `merge` is not supported by Daft Delta Lake writes; use `mode="merge"` and the `merge_*` arguments for Delta MERGE semantics.
+            merge_predicate (str, optional): SQL predicate used to match source rows against target rows when `mode="merge"`, e.g. `target.id = source.id`.
+            merge_source_alias (str, optional): Alias for the staged source rows in the merge predicate and expressions. Defaults to `source`.
+            merge_target_alias (str, optional): Alias for the target Delta table in the merge predicate and expressions. Defaults to `target`.
+            merge_when_matched_update_all (bool, optional): Add a `WHEN MATCHED THEN UPDATE SET *` clause.
+            merge_when_not_matched_insert_all (bool, optional): Add a `WHEN NOT MATCHED THEN INSERT *` clause.
+            merge_when_matched_updates (Mapping[str, str], optional): Column-to-SQL-expression assignments for a `WHEN MATCHED THEN UPDATE` clause.
+            merge_when_matched_delete (str, optional): Optional predicate for a `WHEN MATCHED THEN DELETE` clause. Use an empty string to make the delete unconditional.
+            merge_when_not_matched_insert (Mapping[str, str], optional): Column-to-SQL-expression assignments for a `WHEN NOT MATCHED THEN INSERT` clause.
             name (str, optional): User-provided identifier for this table.
             description (str, optional): User-provided description for this table.
             configuration (Mapping[str, Optional[str]], optional): A map containing configuration options for the metadata action.
@@ -1500,6 +1519,32 @@ class DataFrame:
 
         if parse(deltalake.__version__) < parse("0.14.0"):
             raise ValueError(f"Write delta lake is only supported on deltalake>=0.14.0, found {deltalake.__version__}")
+
+        if schema_mode == "merge":
+            raise ValueError(
+                'Schema mode "merge" is not supported for write_deltalake. '
+                'Use mode="merge" with the merge_* arguments for Delta MERGE semantics.'
+            )
+
+        if mode == "merge":
+            if parse(deltalake.__version__) < parse("1.5.0"):
+                raise ValueError(f"Delta Lake merge writes require deltalake>=1.5.0, found {deltalake.__version__}")
+            if merge_predicate is None:
+                raise ValueError('merge_predicate is required when mode="merge".')
+            if merge_when_matched_update_all and merge_when_matched_updates is not None:
+                raise ValueError("Only one of merge_when_matched_update_all and merge_when_matched_updates may be set.")
+            if merge_when_not_matched_insert_all and merge_when_not_matched_insert is not None:
+                raise ValueError(
+                    "Only one of merge_when_not_matched_insert_all and merge_when_not_matched_insert may be set."
+                )
+            if not (
+                merge_when_matched_update_all
+                or merge_when_matched_updates is not None
+                or merge_when_matched_delete is not None
+                or merge_when_not_matched_insert_all
+                or merge_when_not_matched_insert is not None
+            ):
+                raise ValueError('At least one merge action is required when mode="merge".')
 
         io_config = get_context().daft_planning_config.default_io_config if io_config is None else io_config
 
@@ -1584,8 +1629,77 @@ class DataFrame:
                     }
                 )
             version = table.version() + 1
+        elif mode == "merge":
+            raise ValueError('Cannot use mode="merge" with a non-existent Delta table.')
         else:
             version = 0
+
+        if mode == "merge":
+            if partition_cols:
+                raise ValueError(
+                    'partition_cols cannot be supplied for mode="merge"; the existing Delta table partitioning is used.'
+                )
+
+            staging_cleanup_path = None
+            if scheme == "file":
+                staging_parent = tempfile.mkdtemp(prefix=".daft-delta-merge-", dir=os.path.dirname(table_uri) or None)
+                staging_uri = os.path.join(staging_parent, "source")
+                staging_cleanup_path = staging_parent
+            else:
+                staging_uri = os.path.join(
+                    table_uri.rstrip("/"),
+                    "_daft_merge_staging",
+                    uuid4().hex,
+                    "source",
+                )
+            try:
+                staging_result = self.write_deltalake(
+                    staging_uri,
+                    mode="error",
+                    schema_mode=schema_mode,
+                    custom_metadata={"daft.delta.merge.staging": "true"},
+                    allow_unsafe_rename=allow_unsafe_rename,
+                    io_config=io_config,
+                )
+
+                source_table = deltalake.DeltaTable(staging_uri, storage_options=storage_options)
+                source_reader = source_table.to_pyarrow_dataset().scanner().to_reader()
+
+                metadata_param = _create_metadata_param(custom_metadata)
+                merger = table.merge(
+                    source_reader,
+                    predicate=merge_predicate,
+                    source_alias=merge_source_alias,
+                    target_alias=merge_target_alias,
+                    streamed_exec=True,
+                    commit_properties=metadata_param,
+                )
+                if merge_when_matched_delete is not None:
+                    merger = merger.when_matched_delete(predicate=merge_when_matched_delete or None)
+                if merge_when_matched_update_all:
+                    merger = merger.when_matched_update_all()
+                elif merge_when_matched_updates is not None:
+                    merger = merger.when_matched_update(dict(merge_when_matched_updates))
+                if merge_when_not_matched_insert_all:
+                    merger = merger.when_not_matched_insert_all()
+                elif merge_when_not_matched_insert is not None:
+                    merger = merger.when_not_matched_insert(dict(merge_when_not_matched_insert))
+
+                metrics = merger.execute()
+                table.update_incremental()
+
+                staging_rows = staging_result.to_pydict()["rows"]
+                return from_pydict(
+                    {
+                        "operation": ["MERGE", "STAGE"],
+                        "rows": [int(metrics.get("num_output_rows", 0)), int(sum(staging_rows))],
+                        "file_size": [0, 0],
+                        "file_name": [f"version-{table.version()}", os.path.basename(os.path.dirname(staging_uri))],
+                    }
+                )
+            finally:
+                if staging_cleanup_path is not None:
+                    shutil.rmtree(staging_cleanup_path, ignore_errors=True)
 
         if partition_cols is not None:
             for c in partition_cols:

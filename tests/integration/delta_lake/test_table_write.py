@@ -380,3 +380,57 @@ def test_custom_metadata_updated_for_existing_table_with_commit_properties(
 
         assert isinstance(custom_metadata_arg, _FakeCommitProperties)
         assert custom_metadata_arg.custom_metadata == custom_metadata
+
+
+def test_deltalake_write_merge_update_insert(tmp_path):
+    deltalake = pytest.importorskip("deltalake", minversion="1.5.0")
+    path = tmp_path / "some_table"
+    daft.from_pydict({"id": [1, 2], "value": ["a", "b"]}).write_deltalake(str(path))
+
+    source = daft.from_pydict({"id": [2, 3], "value": ["bb", "c"]}).into_partitions(2)
+    result = source.write_deltalake(
+        str(path),
+        mode="merge",
+        merge_predicate="target.id = source.id",
+        merge_when_matched_update_all=True,
+        merge_when_not_matched_insert_all=True,
+    ).to_pydict()
+
+    assert result["operation"] == ["MERGE", "STAGE"]
+    assert result["rows"] == [3, 2]
+    assert deltalake.DeltaTable(str(path)).to_pyarrow_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3],
+        "value": ["a", "bb", "c"],
+    }
+
+
+def test_deltalake_write_merge_explicit_assignments(tmp_path):
+    deltalake = pytest.importorskip("deltalake", minversion="1.5.0")
+    path = tmp_path / "some_table"
+    daft.from_pydict({"id": [1, 2], "value": ["a", "b"]}).write_deltalake(str(path))
+
+    daft.from_pydict({"id": [2, 3], "value": ["bb", "c"]}).write_deltalake(
+        str(path),
+        mode="merge",
+        merge_predicate="target.id = source.id",
+        merge_when_matched_updates={"value": "source.value"},
+        merge_when_not_matched_insert={"id": "source.id", "value": "source.value"},
+    )
+
+    assert deltalake.DeltaTable(str(path)).to_pyarrow_table().sort_by("id").to_pydict() == {
+        "id": [1, 2, 3],
+        "value": ["a", "bb", "c"],
+    }
+
+
+def test_deltalake_write_merge_requires_predicate_and_action(tmp_path):
+    pytest.importorskip("deltalake", minversion="1.5.0")
+    path = tmp_path / "some_table"
+    daft.from_pydict({"id": [1], "value": ["a"]}).write_deltalake(str(path))
+
+    source = daft.from_pydict({"id": [1], "value": ["b"]})
+    with pytest.raises(ValueError, match="merge_predicate is required"):
+        source.write_deltalake(str(path), mode="merge", merge_when_matched_update_all=True)
+
+    with pytest.raises(ValueError, match="At least one merge action"):
+        source.write_deltalake(str(path), mode="merge", merge_predicate="target.id = source.id")
