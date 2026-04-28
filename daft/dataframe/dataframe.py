@@ -1498,9 +1498,6 @@ class DataFrame:
 
                 return CommitProperties(custom_metadata=metadata)
 
-        if schema_mode == "merge":
-            raise ValueError("Schema mode' merge' is not currently supported for write_deltalake.")
-
         if parse(deltalake.__version__) < parse("0.14.0"):
             raise ValueError(f"Write delta lake is only supported on deltalake>=0.14.0, found {deltalake.__version__}")
 
